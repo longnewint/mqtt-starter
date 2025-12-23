@@ -1,21 +1,29 @@
+mod shared;
+
 use axum::{
     extract::State,
     routing::{get, post},
     Router,
     Json,
 };
+
 use paho_mqtt as mqtt;
-use rand::Rng;
+
 use serde::{Deserialize, Serialize};
 use serde_json;
+
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
+
+use crate::shared::weather2::WeatherStation;
 
 #[derive(Clone)]
 struct AppState {
     mqtt_client: Arc<Mutex<mqtt::Client>>,
     is_publishing: Arc<Mutex<bool>>,
+    stations: Arc<Vec<WeatherStation>>,
+    current_station: Arc<Mutex<usize>>
 }
 
 #[derive(Serialize, Deserialize)]
@@ -24,19 +32,14 @@ struct StatusResponse {
     publishing: bool,
 }
 
-#[derive(Serialize)]
-struct WeatherRecord {
-    station_id: u8,
-    temperature: u8,
-    humidity: u8
-}
+
 
 #[tokio::main]
 async fn main() {
     // Configure MQTT
     let broker_url = "tcp://localhost:1883"; // Change to your broker
     let client_id = "rust_axum_publisher";
-    let topic = "random/numbers";
+    let topic = "random/weather";
 
     // Create MQTT client
     let create_opts = mqtt::CreateOptionsBuilder::new()
@@ -54,12 +57,27 @@ async fn main() {
 
     client.connect(conn_opts).expect("Failed to connect to MQTT broker");
     println!("✓ Connected to MQTT broker at {}", broker_url);
+    
+    let stations = Arc::new(vec![
+        WeatherStation::new(1, "Station01", 10.0),
+        WeatherStation::new(3, "Station03", 20.0),
+        WeatherStation::new(7, "Station07", 30.0),
+    ]);
+
+    println!(" Created 3 stations:");
+    for st in stations.iter() {
+        println!(" station_id: {}, station_name: {}", st.id, st.name());
+    }
 
     // Wrap client in Arc<Mutex> for thread-safe sharing
     let state = AppState {
         mqtt_client: Arc::new(Mutex::new(client)),
-        is_publishing: Arc::new(Mutex::new(false)),
+        is_publishing: Arc::new(Mutex::new(true)),
+        stations,
+        current_station: Arc::new(Mutex::new(0))
     };
+    
+    println!(" Auto-publishing started (round-robin every 1 second)");
 
     // Start background task to publish every second
     let publish_state = state.clone();
@@ -79,11 +97,10 @@ async fn main() {
         .await
         .expect("Failed to bind to port 3000");
 
-    println!("🚀 Server running on http://localhost:3000");
-    println!("   POST /start      - Start auto-publishing every 1s");
-    println!("   POST /stop       - Stop auto-publishing");
-    println!("   POST /publish    - Publish a single random number");
-    println!("   GET  /status     - Check publishing status");
+    println!(" Server running on http://localhost:3000");
+    println!(" POST /start      - Start auto-publishing every 1s");
+    println!(" POST /stop       - Stop auto-publishing");
+    println!(" GET  /status     - Check publishing status");
 
     axum::serve(listener, app)
         .await
@@ -93,9 +110,6 @@ async fn main() {
 async fn publish_loop(state: AppState, topic: &str) {
     let mut ticker = interval(Duration::from_secs(1));
 
-    let stations = vec![1, 2, 3];
-    let mut rr = stations.iter().cycle();
-
     loop {
         ticker.tick().await;
 
@@ -103,14 +117,14 @@ async fn publish_loop(state: AppState, topic: &str) {
         if !is_active {
             continue;
         }
+        
+        let mut current_idx = state.current_station.lock().await;
+        let gen_idx = *current_idx;
+        *current_idx = (gen_idx + 1) % state.stations.len();
+        drop(current_idx);
 
-        let random_temperature: u8 = rand::rng().random_range(0..35);
-        let random_humidity: u8 = rand::rng().random_range(0..100);
-        let record = WeatherRecord {
-            station_id: *rr.next().unwrap(),
-            temperature: random_temperature,
-            humidity: random_humidity
-        };
+        let station = &state.stations[gen_idx];
+        let record = station.generate_data();
 
         let client = state.mqtt_client.lock().await;
         let payload = serde_json::to_string(&record).expect("Failed to serialize");
@@ -119,10 +133,10 @@ async fn publish_loop(state: AppState, topic: &str) {
 
         match client.publish(msg) {
             Ok(_) => {
-                println!("📤 Published: {} to topic '{}'", payload, topic);
+                println!(" Published: {} to topic '{}'", payload, topic);
             }
             Err(e) => {
-                eprintln!("❌ Failed to publish: {:?}", e);
+                eprintln!(" Failed to publish: {:?}", e);
             }
         }
     }
@@ -131,7 +145,7 @@ async fn publish_loop(state: AppState, topic: &str) {
 async fn start_publishing(State(state): State<AppState>) -> Json<StatusResponse> {
     let mut is_publishing = state.is_publishing.lock().await;
     *is_publishing = true;
-    println!("▶️  Started auto-publishing");
+    println!(" Started auto-publishing");
     
     Json(StatusResponse {
         status: "Started publishing every 1 second".to_string(),
@@ -142,7 +156,7 @@ async fn start_publishing(State(state): State<AppState>) -> Json<StatusResponse>
 async fn stop_publishing(State(state): State<AppState>) -> Json<StatusResponse> {
     let mut is_publishing = state.is_publishing.lock().await;
     *is_publishing = false;
-    println!("⏸️  Stopped auto-publishing");
+    println!(" Stopped auto-publishing");
     
     Json(StatusResponse {
         status: "Stopped publishing".to_string(),
