@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 
-use crate::shared::weather2::WeatherStation;
+use crate::shared::weather::WeatherStation;
 
 #[derive(Clone)]
 struct AppState {
